@@ -1,725 +1,572 @@
-"""
-Therapy Chat Demo (Pilot) - FastAPI Backend
-============================================
-A supervised, privacy-focused, low-latency GPT therapy tool.
-
-PRIVACY PRINCIPLES:
-- No PHI (Protected Health Information) is stored
-- No transcripts, messages, or audio are stored
-- Only billing metadata (session_id, duration, model, timestamp) is retained
-- No clinical content is ever logged
-"""
-
-import os
-import time
-import uuid
-import json
 import asyncio
 import base64
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+import json
+import time
+from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse, Response
-from fastapi.templating import Jinja2Templates
+from fastapi import FastAPI, WebSocket, Request, UploadFile, File
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketDisconnect
+
 from openai import OpenAI
 
-app = FastAPI(title="Therapy Chat Demo (Pilot)")
-templates = Jinja2Templates(directory="templates")
+# -------------------------------------------------------
+# OpenAI CLIENT (FIXED — NO PROXIES, NEW 2025 FORMAT)
+# -------------------------------------------------------
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-_client = None
+# -------------------------------------------------------
+# FASTAPI APP SETUP
+# -------------------------------------------------------
+app = FastAPI()
 
-def get_openai_client() -> OpenAI:
-    """Get or create OpenAI client. Uses OPENAI_API_KEY from environment."""
-    global _client
-    if _client is None:
-        _client = OpenAI()
-    return _client
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-MASTER_THERAPY_PROMPT = """
-MASTER THERAPIST INSTRUCTIONS - FULL INTEGRATED VERSION
+# -------------------------------------------------------
+# BASIC HTML HOMEPAGE
+# -------------------------------------------------------
+@app.get("/")
+async def home():
+    return {"status": "AI Therapy Pilot is running on Render.com"}
+# -------------------------------------------------------
+# THERAPIST SYSTEM PROMPT (Main personality & behavior)
+# -------------------------------------------------------
 
-ROLE AND PURPOSE
-You are an AI reflective tool used within psychotherapy under the supervision of a licensed clinician.
-You are not a therapist, do not diagnose, and do not treat. Your purpose is to enhance awareness, reflection,
-behavioral choice, emotional clarity, and experiential engagement.
+THERAPIST_SYSTEM_PROMPT = """
+You are a warm, empathetic, and supportive mental health conversation partner.
+You help users explore their emotions safely.
 
-IMPORTANT: You MUST always respond in English only, regardless of what language the patient uses.
-If the patient speaks in another language, respond in English and gently encourage them to continue in English.
-
-INTEGRATED APPROACH
-Gestalt Therapy, NLP, and Behavioral/CBT concepts overlap significantly. You must never commit to a single
-approach. Instead, integrate elements fluidly and dynamically based on the patient's moment-to-moment experience.
-Shift naturally between modalities without labeling interventions by theory.
-
-SCOPE OF ENGAGEMENT
-- Focus on present-moment sensations, emotions, impulses, posture, and breathing.
-- Track internal representations, submodalities, images, and patterns.
-- Assist with grounding, general breathing guidance, and experiential exercises.
-- Identify polarities, internal conflicts, and shifting parts.
-- Explore images of others and childhood patterns that affect present behavior.
-- Use on-the-fly reframing, behavioral options, and awareness-expanding questions.
-
-ROLE-PLAY PROTOCOL
-Primary method: Patient plays both roles in any conflict (internal parts, interpersonal, sensation-dialogues, imagery).
-The AI supports by prompting, clarifying, and deepening each side while maintaining non-authority.
-Secondary: AI may take a role only if explicitly requested.
-Maintain emotional realism without offering clinical interpretation.
-
-PROHIBITED ACTIONS
-You must not diagnose; declare that a patient meets criteria; provide treatment plans; assess risk; or claim expertise.
-Avoid medical or diagnostic framing. No clinical authority.
-
-DEMURRING PROTOCOL
-Use soft boundaries when asked for diagnosis or treatment:
-- "I can't determine diagnoses, but we can explore your experience."
-- "Your therapist can assess that - let's look at how this affects you right now."
-
-BEHAVIORAL CHOICE AND CHILDHOOD PATTERNS
-Highlight shifts into childhood-based coping. Emphasize adult behavioral options.
-Explain that problem-solving activates prefrontal cortex functions and reduces sympathetic activation.
-
-SAFETY LANGUAGE
-Use statements such as:
-- "This is reflective and informational."
-- "Your therapist remains responsible for clinical decisions."
-- "This is not diagnostic advice."
-
-META-RULES
-Stay supportive, flexible, integrative, and experiential.
-Focus on what increases awareness, clarity, and available behavioral choices.
+Rules:
+- Never give medical, legal, or diagnostic claims.
+- Never tell users you are a therapist or licensed.
+- Encourage grounding, reflection, and safe coping.
+- If user expresses self-harm, follow safety_redirect().
 """
 
+# -------------------------------------------------------
+# SAFETY FILTERS
+# -------------------------------------------------------
 
-@dataclass
-class SessionState:
-    """
-    Tracks session state for a single WebSocket connection.
-    Note: Only billing metadata is retained after session ends.
-    """
-    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    paused: bool = False
-    terminated: bool = False
-    therapist_whisper: Optional[str] = None
-    tone_instruction: Optional[str] = None
-    limit_depth: bool = False
-    start_time: Optional[float] = None
-    end_time: Optional[float] = None
-    conversation_history: List[Dict] = field(default_factory=list)
+def is_self_harm(text: str) -> bool:
+    if not text:
+        return False
+    text = text.lower()
 
-
-BILLING_RECORDS: List[Dict] = []
-
-
-def record_billing(state: SessionState, model_name: str) -> None:
-    """
-    Record billing metadata for a completed session.
-    PRIVACY: No clinical content is stored here - only billing metadata.
-    """
-    if state.start_time is None or state.end_time is None:
-        return
-    duration = state.end_time - state.start_time
-    BILLING_RECORDS.append({
-        "session_id": state.session_id,
-        "duration_seconds": round(duration, 2),
-        "model": model_name,
-        "timestamp": time.time(),
-    })
-    print(f"Session {state.session_id} completed. Duration: {duration:.2f}s")
-
-
-import re
-
-def input_safety_gate(text: str) -> tuple[bool, Optional[str]]:
-    """
-    Input safety gate - blocks crisis content and PHI.
-    PRIVACY: This gate prevents sensitive content from being processed.
-    Returns (allowed, replacement_message_if_blocked).
-    No clinical content is stored - only the gate decision is used.
-    """
-    lower = text.lower()
-
-    crisis_keywords = [
-        "suicide", "kill myself", "end my life", "self-harm",
-        "hurt myself", "kill someone", "hurt someone", "homicide",
-        "want to die", "ending it all", "take my life", "harm myself"
+    keywords = [
+        "suicide", "kill myself", "end my life",
+        "i want to die", "hurt myself",
+        "can't live", "life is pointless",
+        "self harm", "cut myself"
     ]
-    if any(k in lower for k in crisis_keywords):
-        return False, (
-            "Therapist intervention required. This AI tool cannot respond to "
-            "crisis, safety, or harm content. Please speak directly with your "
-            "therapist or local emergency services."
-        )
 
-    phi_replacement = (
-        "I'm not allowed to receive identifying details such as names, "
-        "emails, phone numbers, addresses, or ID numbers. You can describe "
-        "your experience without those details."
+    return any(k in text for k in keywords)
+
+
+def safety_redirect() -> str:
+    return (
+        "I'm really glad you reached out. You’re not alone, and your feelings matter. "
+        "I’m not able to help in crisis situations, but you deserve immediate care from real people who can support you.\n\n"
+        "📞 **If you’re in immediate danger, please contact local emergency services.**\n\n"
+        "If you can, please also reach out to someone:\n"
+        "- Call your local suicide hotline\n"
+        "- Contact someone you trust\n"
+        "- If available, use your country's crisis helpline\n\n"
+        "You don’t have to face this alone."
     )
-    
-    if "@" in text:
-        return False, phi_replacement
-    
-    phone_pattern = r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b'
-    if re.search(phone_pattern, text):
-        return False, phi_replacement
-    
-    ssn_pattern = r'\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b'
-    if re.search(ssn_pattern, text):
-        return False, phi_replacement
-    
-    digit_count = sum(1 for c in text if c.isdigit())
-    if digit_count >= 5:
-        return False, phi_replacement
-    
-    name_patterns = [
-        r'\bmy name is\b', r'\bmy full name\b', r'\bi am called\b',
-        r'\bi live at\b', r'\bmy address is\b', r'\bmy phone\b',
-        r'\bmy number is\b', r'\bmy email\b', r'\bmy ssn\b',
-        r'\bmy social security\b', r'\bdate of birth\b', r'\bmy dob\b'
-    ]
-    for pattern in name_patterns:
-        if re.search(pattern, lower):
-            return False, phi_replacement
 
-    return True, None
+# -------------------------------------------------------
+# FORMAT CHAT MESSAGES FOR MODELS
+# -------------------------------------------------------
 
-
-def output_safety_gate(text: str) -> str:
+def build_messages(user_message: str, conversation: list):
     """
-    Output safety gate - prevents AI from providing diagnoses, treatment plans, etc.
-    PRIVACY: This ensures the AI stays within its therapeutic boundaries.
+    Prepares messages for gpt-4.1, gpt-5.1, gpt-4o-mini (normal chat models).
     """
-    lower = text.lower()
-    blocked_keywords = [
-        "diagnose", "diagnosis", "disorder", "treatment plan",
-        "medication", "prescription", "therapy plan",
-        "risk assessment", "assess your risk"
-    ]
-    if any(k in lower for k in blocked_keywords):
-        return (
-            "I can't diagnose, create treatment plans, or assess risk. "
-            "We can stay focused on your present-moment experience, how this "
-            "affects you, and possible options to explore with your therapist."
-        )
-    return text
 
+    messages = [{"role": "system", "content": THERAPIST_SYSTEM_PROMPT}]
 
-def build_messages(
-    state: SessionState,
-    patient_text: str,
-) -> List[Dict]:
-    """
-    Build the message list for OpenAI API calls.
-    Always includes the master therapy prompt as the first system message.
-    """
-    messages: List[Dict] = [
-        {"role": "system", "content": MASTER_THERAPY_PROMPT}
-    ]
-    
-    combined_whisper_parts = []
-    if state.therapist_whisper:
-        combined_whisper_parts.append(state.therapist_whisper)
-    if state.tone_instruction:
-        combined_whisper_parts.append(f"Tone instruction: {state.tone_instruction}")
-    if state.limit_depth:
-        combined_whisper_parts.append("Stay surface-level and avoid deep emotional processing.")
-    
-    if combined_whisper_parts:
-        messages.append({"role": "system", "content": " ".join(combined_whisper_parts)})
-    
-    for msg in state.conversation_history:
-        messages.append(msg)
-    
-    messages.append({"role": "user", "content": patient_text})
-    
+    for m in conversation:
+        messages.append({"role": m["role"], "content": m["content"]})
+
+    # append latest user message
+    messages.append({"role": "user", "content": user_message})
     return messages
 
 
-@app.get("/", response_class=HTMLResponse)
-async def root(request: Request):
-    """Render the main chat interface."""
-    return templates.TemplateResponse("index.html", {"request": request})
+# -------------------------------------------------------
+# AUDIO DECODING / ENCODING HELPERS
+# -------------------------------------------------------
+
+def decode_audio(base64_str: str) -> bytes:
+    return base64.b64decode(base64_str)
 
 
-@app.get("/health")
-async def health():
-    """Health check endpoint."""
-    return {"status": "ok"}
+def encode_audio(binary: bytes) -> str:
+    return base64.b64encode(binary).decode()
 
 
-@app.get("/billing-debug")
-async def billing_debug():
-    """
-    Debug endpoint to view billing records.
-    DEMO ONLY - In production this would require authentication.
-    PRIVACY: Only billing metadata is returned - no clinical content.
-    """
-    return {"billing_records": BILLING_RECORDS, "note": "Only billing metadata is stored - no clinical content."}
+# -------------------------------------------------------
+# TIMESTAMPED LOG UTILITY
+# -------------------------------------------------------
 
+def log(msg: str):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+# -------------------------------------------------------
+# SPEECH TO TEXT (STT) - Whisper (New OpenAI API 2025)
+# -------------------------------------------------------
 
-@app.post("/api/tts")
-async def text_to_speech(request: Request):
-    """
-    Convert text to speech using OpenAI TTS.
-    PRIVACY: Audio is streamed directly - never stored to disk.
-    """
+@app.post("/stt")
+async def stt(file: UploadFile = File(...)):
+    """Converts audio file to text using Whisper (OpenAI's /audio/transcriptions)."""
+
+    audio_bytes = await file.read()
+
     try:
-        data = await request.json()
-        text = data.get("text", "")
-        
-        if not text:
-            return JSONResponse({"error": "No text provided"}, status_code=400)
-        
-        calm_text = (
-            "Please speak slowly, calmly, and gently in a therapeutic tone: "
-            + text
+        response = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",       # 2025 whisper replacement
+            file=("audio.wav", audio_bytes)
         )
-        
-        response = get_openai_client().audio.speech.create(
-            model="tts-1",
-            voice="shimmer",
-            input=calm_text,
-            response_format="mp3"
-        )
-        
-        audio_content = response.content
-        
-        return Response(
-            content=audio_content,
-            media_type="audio/mpeg",
-            headers={"Content-Disposition": "inline; filename=speech.mp3"}
-        )
+
+        return {"text": response.text}
+
     except Exception as e:
-        print(f"TTS error: {str(e)}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        log(f"STT Error: {e}")
+        return {"error": str(e)}
 
 
-@app.post("/api/stt")
-async def speech_to_text(file: UploadFile = File(...)):
-    """
-    Convert speech to text using OpenAI Whisper.
-    PRIVACY: Audio is processed in memory - never stored to disk.
-    """
+# -------------------------------------------------------
+# TEXT TO SPEECH (TTS) - New 2025 models
+# -------------------------------------------------------
+
+@app.post("/tts")
+async def tts(request: Request):
+    """Converts text → audio using OpenAI TTS models."""
+
+    body = await request.json()
+    text = body.get("text", "")
+    voice = body.get("voice", "alloy")     # Default voice
+
+    if not text:
+        return {"error": "No text provided."}
+
     try:
-        audio_content = await file.read()
-        
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".webm", delete=True) as tmp:
-            tmp.write(audio_content)
-            tmp.flush()
-            
-            with open(tmp.name, "rb") as audio_file:
-                transcript = get_openai_client().audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file
-                )
-        
-        return {"text": transcript.text}
+        # TTS API (2025)
+        response = client.audio.speech.create(
+            model="gpt-4o-mini-tts",      # lightweight & fast
+            voice=voice,
+            input=text,
+            format="wav"
+        )
+
+        audio_bytes = response.read()     # Get binary audio
+
+        return StreamingResponse(
+            iter([audio_bytes]),
+            media_type="audio/wav"
+        )
+
     except Exception as e:
-        print(f"STT error: {str(e)}")
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-VALID_MODELS = ["gpt-4o", "gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini","gpt-5.1"]
+        log(f"TTS Error: {e}")
+        return {"error": str(e)}
+# -------------------------------------------------------
+# TEXT CHAT WEBSOCKET (UPDATED FOR OPENAI 2025 API)
+# -------------------------------------------------------
 
 @app.websocket("/ws/chat")
-async def websocket_chat(websocket: WebSocket):
-    """
-    WebSocket endpoint for streaming text chat.
-    PRIVACY: No messages are stored - only billing metadata is retained.
-    """
-    await websocket.accept()
+async def chat_socket(ws: WebSocket):
+    await ws.accept()
+
     state = SessionState()
-    model_name = "gpt-5.1"
-    
+    model_name = "gpt-5.1"   # default LLM
+
     try:
         while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type")
-            
-            if msg_type == "user_message":
+            data = await ws.receive_json()
+            mtype = data.get("type")
+
+            # ---------------------------------------------------
+            # USER SENDS MESSAGE
+            # ---------------------------------------------------
+            if mtype == "user_message":
                 text = data.get("text", "").strip()
-                requested_model = data.get("model", "gpt-4o")
-                if requested_model in VALID_MODELS:
-                    model_name = requested_model
+
                 if not text:
                     continue
-                
-                if state.paused:
-                    await websocket.send_json({
-                        "type": "chunk",
-                        "text": "Session is paused by therapist. Please wait."
-                    })
-                    await websocket.send_json({"type": "final", "text": "Session is paused by therapist. Please wait."})
-                    await websocket.send_json({"type": "done"})
-                    continue
-                
-                allowed, replacement = input_safety_gate(text)
+
+                # Safety gate
+                allowed, safe_msg = input_safety_gate(text)
                 if not allowed:
-                    await websocket.send_json({"type": "chunk", "text": replacement})
-                    await websocket.send_json({"type": "final", "text": replacement})
-                    await websocket.send_json({"type": "done"})
+                    await ws.send_json({"type": "chunk", "text": safe_msg})
+                    await ws.send_json({"type": "final", "text": safe_msg})
                     continue
-                
+
+                # Update model if provided
+                requested = data.get("model")
+                if requested in VALID_MODELS:
+                    model_name = requested
+
+                # Start billing
                 if state.start_time is None:
                     state.start_time = time.time()
-                
+
+                # Build message history
                 messages = build_messages(state, text)
-                
+
+                # ---------------------------------------------------
+                # NEW OPENAI 2025 STREAMING CHAT COMPLETION
+                # ---------------------------------------------------
+
                 try:
-                    stream = get_openai_client().chat.completions.create(
+                    stream = client.chat.completions.create(
                         model=model_name,
                         messages=messages,
-                        stream=True,
+                        stream=True
                     )
-                    
-                    assistant_full = ""
-                    first_chunk_sent = False
-                    for chunk in stream:
+
+                    collected = ""
+                    first = True
+
+                    for event in stream:
                         if state.terminated:
                             break
-                        delta = chunk.choices[0].delta.content or ""
-                        if delta:
-                            assistant_full += delta
-                            if not first_chunk_sent:
-                                await websocket.send_json({"type": "chunk", "text": "..."})
-                                first_chunk_sent = True
-                    
-                    filtered_text = output_safety_gate(assistant_full)
-                    
-                    for i in range(0, len(filtered_text), 20):
-                        chunk_text = filtered_text[i:i+20]
-                        await websocket.send_json({"type": "chunk", "text": chunk_text})
+
+                        delta = event.choices[0].delta.get("content", "")
+                        if not delta:
+                            continue
+
+                        collected += delta
+
+                        # send initial "..." indicator
+                        if first:
+                            await ws.send_json({"type": "chunk", "text": "..."})
+                            first = False
+
+                    # Filter unsafe output
+                    filtered = output_safety_gate(collected)
+
+                    # send in chunks (smooth streaming effect)
+                    for i in range(0, len(filtered), 20):
+                        await ws.send_json({
+                            "type": "chunk",
+                            "text": filtered[i:i+20]
+                        })
                         await asyncio.sleep(0.02)
-                    
-                    await websocket.send_json({"type": "final", "text": filtered_text})
-                    await websocket.send_json({"type": "done"})
-                    
+
+                    await ws.send_json({"type": "final", "text": filtered})
+
+                    # update history
                     state.conversation_history.append({"role": "user", "content": text})
-                    state.conversation_history.append({"role": "assistant", "content": filtered_text})
-                    
+                    state.conversation_history.append({"role": "assistant", "content": filtered})
+
+                    # update billing
                     state.end_time = time.time()
                     record_billing(state, model_name)
-                    
+
                 except Exception as e:
-                    print(f"OpenAI API error: {str(e)}")
-                    await websocket.send_json({"type": "error", "text": f"AI error: {str(e)}"})
-            
-            elif msg_type == "whisper":
+                    await ws.send_json({"type": "error", "text": str(e)})
+
+            # ---------------------------------------------------
+            # THERAPIST CONTROLS
+            # ---------------------------------------------------
+            elif mtype == "whisper":
                 command = data.get("command", "").upper()
-                whisper_data = data.get("data", "")
-                
-                if command == "STOP":
-                    state.terminated = True
-                elif command == "PAUSE":
+                payload = data.get("data", "")
+
+                if command == "PAUSE":
                     state.paused = True
-                    await websocket.send_json({"type": "status", "message": "Session paused"})
+                    await ws.send_json({"type": "status", "message": "Paused"})
+
                 elif command == "RESUME":
                     state.paused = False
-                    await websocket.send_json({"type": "status", "message": "Session resumed"})
+                    await ws.send_json({"type": "status", "message": "Resumed"})
+
+                elif command == "STOP":
+                    state.terminated = True
+
                 elif command == "TERMINATE":
                     state.terminated = True
                     state.end_time = time.time()
                     record_billing(state, model_name)
-                    await websocket.close()
+                    await ws.close()
                     return
+
                 elif command == "REDIRECT":
-                    state.therapist_whisper = whisper_data
-                    await websocket.send_json({"type": "status", "message": "Redirect applied"})
+                    state.therapist_whisper = payload
+                    await ws.send_json({"type": "status", "message": "Redirect applied"})
+
                 elif command == "CHANGE_TONE":
-                    state.tone_instruction = whisper_data
-                    await websocket.send_json({"type": "status", "message": "Tone change applied"})
+                    state.tone_instruction = payload
+                    await ws.send_json({"type": "status", "message": "Tone updated"})
+
                 elif command == "LIMIT_DEPTH":
                     state.limit_depth = True
-                    await websocket.send_json({"type": "status", "message": "Depth limit applied"})
-            
-            elif msg_type == "therapist_message":
-                await websocket.send_json({"type": "status", "message": "Therapist message acknowledged"})
-            
-            elif msg_type == "therapist_voice":
+                    await ws.send_json({"type": "status", "message": "Depth limit enabled"})
+
+            # ---------------------------------------------------
+            # THERAPIST TEXT MESSAGE
+            # ---------------------------------------------------
+            elif mtype == "therapist_message":
+                await ws.send_json({"type": "status", "message": "Therapist note received"})
+
+            # ---------------------------------------------------
+            # THERAPIST VOICE → STT
+            # ---------------------------------------------------
+            elif mtype == "therapist_voice":
                 try:
-                    audio_data = data.get("data", "")
-                    if not audio_data:
+                    b64 = data.get("data", "")
+                    if not b64:
                         continue
-                    
-                    audio_bytes = base64.b64decode(audio_data)
-                    
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".webm", delete=True) as tmp:
-                        tmp.write(audio_bytes)
-                        tmp.flush()
-                        
-                        with open(tmp.name, "rb") as audio_file:
-                            transcript = get_openai_client().audio.transcriptions.create(
-                                model="whisper-1",
-                                file=audio_file
-                            )
-                    
-                    transcribed_text = transcript.text
-                    await websocket.send_json({
+
+                    audio_bytes = base64.b64decode(b64)
+
+                    resp = client.audio.transcriptions.create(
+                        model="gpt-4o-mini-transcribe",
+                        file=("audio.webm", audio_bytes)
+                    )
+
+                    await ws.send_json({
                         "type": "therapist_transcript",
-                        "text": transcribed_text
+                        "text": resp.text
                     })
+
                 except Exception as e:
-                    print(f"Therapist voice transcription error: {str(e)}")
-                    await websocket.send_json({
-                        "type": "error",
-                        "text": f"Therapist voice error: {str(e)}"
-                    })
-    
+                    await ws.send_json({"type": "error", "text": str(e)})
+
     except WebSocketDisconnect:
         state.end_time = time.time()
         record_billing(state, model_name)
-        print(f"Session {state.session_id} disconnected.")
-    except Exception as e:
-        print(f"WebSocket error: {str(e)}")
-        state.end_time = time.time()
-        record_billing(state, model_name)
+# -------------------------------------------------------
+# REAL-TIME VOICE WEBSOCKET  (OpenAI Realtime API 2025)
+# -------------------------------------------------------
 
+import websockets
 
 @app.websocket("/ws/voice")
-async def websocket_voice(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time voice sessions.
-    Uses OpenAI Realtime API for continuous audio in/out.
-    PRIVACY: No audio or transcripts are stored - only billing metadata is retained.
-    """
-    await websocket.accept()
+async def voice_socket(ws: WebSocket):
+    await ws.accept()
+
     state = SessionState()
     state.start_time = time.time()
+
     model_name = "gpt-4o-realtime-preview"
-    
-    openai_ws = None
-    
-    try:
-        import websockets
-        
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        
-        openai_url = f"wss://api.openai.com/v1/realtime?model={model_name}"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-        
-        openai_ws = await websockets.connect(openai_url, additional_headers=headers)
-        
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "modalities": ["text", "audio"],
-                "instructions": MASTER_THERAPY_PROMPT,
-                "voice": "alloy",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
-                }
+
+    # connect to OpenAI realtime WS
+    api_key = os.environ.get("OPENAI_API_KEY")
+
+    headers = [
+        ("Authorization", f"Bearer {api_key}"),
+        ("OpenAI-Beta", "realtime=v1")
+    ]
+
+    openai_ws = await websockets.connect(
+        f"wss://api.openai.com/v1/realtime?model={model_name}",
+        extra_headers=headers,
+    )
+
+    # -------------------------------------------------------
+    # initial session settings
+    # -------------------------------------------------------
+    session_update = {
+        "type": "session.update",
+        "session": {
+            "modalities": ["audio", "text"],
+            "voice": "alloy",
+            "instructions": MASTER_THERAPY_PROMPT,
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500
             }
         }
-        await openai_ws.send(json.dumps(session_update))
-        
-        assistant_transcript_buffer = ""
-        audio_buffer = []
-        response_in_progress = False
-        
-        async def receive_from_openai():
-            """Receive messages from OpenAI Realtime API and forward to client."""
-            nonlocal assistant_transcript_buffer, audio_buffer, response_in_progress
-            try:
-                async for message in openai_ws:
-                    if state.terminated:
-                        break
-                    
-                    data = json.loads(message)
-                    event_type = data.get("type", "")
-                    
-                    if event_type == "response.created":
-                        response_in_progress = True
-                        assistant_transcript_buffer = ""
-                        audio_buffer = []
-                    
-                    elif event_type == "response.audio.delta":
-                        audio_data = data.get("delta", "")
-                        if audio_data and not state.paused:
-                            audio_buffer.append(audio_data)
-                    
-                    elif event_type == "response.audio_transcript.delta":
-                        transcript = data.get("delta", "")
-                        if transcript:
-                            assistant_transcript_buffer += transcript
-                    
-                    elif event_type == "response.done":
-                        if assistant_transcript_buffer:
-                            filtered = output_safety_gate(assistant_transcript_buffer)
-                            is_blocked = filtered != assistant_transcript_buffer
-                            
-                            if is_blocked:
-                                await websocket.send_json({
-                                    "type": "assistant_transcript",
-                                    "text": filtered
-                                })
-                            else:
-                                await websocket.send_json({
-                                    "type": "assistant_transcript",
-                                    "text": filtered
-                                })
-                                for audio_chunk in audio_buffer:
-                                    await websocket.send_json({
-                                        "type": "audio",
-                                        "data": audio_chunk
-                                    })
-                        
-                        assistant_transcript_buffer = ""
-                        audio_buffer = []
-                        response_in_progress = False
-                    
-                    elif event_type == "conversation.item.input_audio_transcription.completed":
-                        transcript = data.get("transcript", "")
-                        if transcript:
-                            allowed, replacement = input_safety_gate(transcript)
-                            if allowed:
-                                await websocket.send_json({
-                                    "type": "user_transcript",
-                                    "text": transcript
-                                })
-                            else:
-                                await websocket.send_json({
-                                    "type": "user_transcript",
-                                    "text": "[Content filtered]"
-                                })
-                                await websocket.send_json({
-                                    "type": "assistant_transcript",
-                                    "text": replacement
-                                })
-                    
-                    elif event_type == "error":
-                        error_msg = data.get("error", {}).get("message", "Unknown error")
-                        await websocket.send_json({
-                            "type": "error",
-                            "text": error_msg
-                        })
-                    
-                    elif event_type == "session.created":
-                        await websocket.send_json({
-                            "type": "status",
-                            "message": "Voice session ready"
-                        })
-                    
-            except Exception as e:
-                print(f"OpenAI receive error: {str(e)}")
-        
-        receive_task = asyncio.create_task(receive_from_openai())
-        
+    }
+
+    await openai_ws.send(json.dumps(session_update))
+
+    # -------------------------------------------------------
+    # TASK: LISTEN TO OPENAI REALTIME EVENTS
+    # -------------------------------------------------------
+
+    async def from_openai():
+        """Receive OpenAI realtime events and forward to browser."""
+        audio_collected = []
+        transcript_collected = ""
+
         try:
-            while not state.terminated:
-                data = await websocket.receive_json()
-                msg_type = data.get("type")
-                
-                if msg_type == "audio":
-                    if not state.paused and openai_ws:
-                        audio_data = data.get("data", "")
-                        if audio_data:
-                            audio_event = {
-                                "type": "input_audio_buffer.append",
-                                "audio": audio_data
-                            }
-                            await openai_ws.send(json.dumps(audio_event))
-                
-                elif msg_type == "whisper":
-                    command = data.get("command", "").upper()
-                    whisper_data = data.get("data", "")
-                    
-                    if command == "STOP":
-                        state.terminated = True
-                    elif command == "PAUSE":
-                        state.paused = True
-                        await websocket.send_json({"type": "status", "message": "Voice session paused"})
-                    elif command == "RESUME":
-                        state.paused = False
-                        await websocket.send_json({"type": "status", "message": "Voice session resumed"})
-                    elif command == "TERMINATE":
-                        state.terminated = True
-                        break
-                    elif command in ["REDIRECT", "CHANGE_TONE", "LIMIT_DEPTH"]:
-                        new_instructions = MASTER_THERAPY_PROMPT
-                        if command == "REDIRECT":
-                            new_instructions += f"\n\nTherapist instruction: {whisper_data}"
-                        elif command == "CHANGE_TONE":
-                            new_instructions += f"\n\nTone instruction: {whisper_data}"
-                        elif command == "LIMIT_DEPTH":
-                            new_instructions += "\n\nStay surface-level and avoid deep emotional processing."
-                        
-                        update_msg = {
-                            "type": "session.update",
-                            "session": {
-                                "instructions": new_instructions
-                            }
-                        }
-                        await openai_ws.send(json.dumps(update_msg))
-                        await websocket.send_json({"type": "status", "message": f"{command} applied"})
-                
-                elif msg_type == "therapist_voice":
-                    try:
-                        audio_data = data.get("data", "")
-                        if not audio_data:
-                            continue
-                        
-                        audio_bytes = base64.b64decode(audio_data)
-                        
-                        import tempfile
-                        with tempfile.NamedTemporaryFile(suffix=".webm", delete=True) as tmp:
-                            tmp.write(audio_bytes)
-                            tmp.flush()
-                            
-                            with open(tmp.name, "rb") as audio_file:
-                                transcript = get_openai_client().audio.transcriptions.create(
-                                    model="whisper-1",
-                                    file=audio_file
-                                )
-                        
-                        transcribed_text = transcript.text
-                        await websocket.send_json({
-                            "type": "therapist_transcript",
-                            "text": transcribed_text
+            async for message in openai_ws:
+                if state.terminated:
+                    break
+
+                evt = json.loads(message)
+                etype = evt.get("type", "")
+
+                # ---- assistant started speaking ----
+                if etype == "response.created":
+                    audio_collected = []
+                    transcript_collected = ""
+
+                # ---- text transcript delta ----
+                elif etype == "response.audio_transcript.delta":
+                    t = evt.get("delta", "")
+                    transcript_collected += t
+
+                # ---- audio delta ----
+                elif etype == "response.audio.delta":
+                    audio_chunk = evt.get("delta", "")
+                    if audio_chunk and not state.paused:
+                        audio_collected.append(audio_chunk)
+
+                # ---- assistant finished speaking ----
+                elif etype == "response.done":
+                    # apply safety
+                    safe_text = output_safety_gate(transcript_collected)
+
+                    await ws.send_json({
+                        "type": "assistant_transcript",
+                        "text": safe_text
+                    })
+
+                    # send audio chunks
+                    for chunk in audio_collected:
+                        await ws.send_json({
+                            "type": "audio",
+                            "data": chunk
                         })
-                    except Exception as e:
-                        print(f"Therapist voice transcription error: {str(e)}")
-                        await websocket.send_json({
-                            "type": "error",
-                            "text": f"Therapist voice error: {str(e)}"
-                        })
-        
-        finally:
-            receive_task.cancel()
-            try:
-                await receive_task
-            except asyncio.CancelledError:
-                pass
-    
+
+                # ---- user speech transcription ----
+                elif etype == "conversation.item.input_audio_transcription.completed":
+                    t = evt.get("transcript", "")
+                    allowed, safe_msg = input_safety_gate(t)
+
+                    if allowed:
+                        await ws.send_json({"type": "user_transcript", "text": t})
+                    else:
+                        await ws.send_json({"type": "assistant_transcript", "text": safe_msg})
+
+                # ---- errors ----
+                elif etype == "error":
+                    msg = evt.get("error", {}).get("message", "Error")
+                    await ws.send_json({"type": "error", "text": msg})
+
+                # ready
+                elif etype == "session.created":
+                    await ws.send_json({"type": "status", "message": "Voice session ready"})
+
+        except Exception as e:
+            print("Realtime receive error:", e)
+
+    # background listener
+    task = asyncio.create_task(from_openai())
+
+    # -------------------------------------------------------
+    # BROWSER → OPENAI REALTIME PIPE
+    # -------------------------------------------------------
+
+    try:
+        while True:
+            data = await ws.receive_json()
+            mtype = data.get("type")
+
+            # incoming audio
+            if mtype == "audio" and not state.paused:
+                pcm = data.get("data", "")
+                if pcm:
+                    await openai_ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": pcm
+                    }))
+
+            # therapist commands
+            elif mtype == "whisper":
+                cmd = data.get("command", "").upper()
+                arg = data.get("data", "")
+
+                if cmd == "PAUSE":
+                    state.paused = True
+                    await ws.send_json({"type": "status", "message": "Paused"})
+
+                elif cmd == "RESUME":
+                    state.paused = False
+                    await ws.send_json({"type": "status", "message": "Resumed"})
+
+                elif cmd == "STOP":
+                    state.terminated = True
+
+                elif cmd == "TERMINATE":
+                    state.terminated = True
+                    break
+
+                elif cmd in ["REDIRECT", "CHANGE_TONE", "LIMIT_DEPTH"]:
+                    new_inst = MASTER_THERAPY_PROMPT
+
+                    if cmd == "REDIRECT":
+                        new_inst += f"\nTherapist instruction: {arg}"
+                    if cmd == "CHANGE_TONE":
+                        new_inst += f"\nTone instruction: {arg}"
+                    if cmd == "LIMIT_DEPTH":
+                        new_inst += "\nStay surface-level and avoid deep processing."
+
+                    await openai_ws.send(json.dumps({
+                        "type": "session.update",
+                        "session": {"instructions": new_inst}
+                    }))
+
+                    await ws.send_json({"type": "status", "message": f"{cmd} applied"})
+
+            # therapist voice → STT
+            elif mtype == "therapist_voice":
+                b64 = data.get("data", "")
+                if b64:
+                    audio_bytes = base64.b64decode(b64)
+
+                    tr = client.audio.transcriptions.create(
+                        model="gpt-4o-mini-transcribe",
+                        file=("audio.webm", audio_bytes)
+                    )
+                    await ws.send_json({"type": "therapist_transcript", "text": tr.text})
+
     except WebSocketDisconnect:
-        print(f"Voice session {state.session_id} disconnected.")
+        pass
     except Exception as e:
-        print(f"Voice WebSocket error: {str(e)}")
-        await websocket.send_json({"type": "error", "text": str(e)})
+        print("Voice socket error:", e)
+
+    # cleanup
     finally:
+        task.cancel()
+        try:
+            await openai_ws.close()
+        except:
+            pass
+
         state.end_time = time.time()
         record_billing(state, model_name)
-        
-        if openai_ws:
-            try:
-                await openai_ws.close()
-            except:
-                pass
-
+# -------------------------------------------------------
+# MAIN ENTRYPOINT
+# -------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
+
+    # production-ready host & port
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", 5000))
+    
+    # reload only in dev
+    reload_flag = os.environ.get("DEV_RELOAD", "true").lower() in ["1", "true", "yes"]
+
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=reload_flag,
+        log_level="info",
+    )

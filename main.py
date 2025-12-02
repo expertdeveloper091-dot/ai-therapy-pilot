@@ -321,6 +321,8 @@ async def speech_to_text(file: UploadFile = File(...)):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+VALID_MODELS = ["gpt-4o", "gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"]
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     """
@@ -338,6 +340,9 @@ async def websocket_chat(websocket: WebSocket):
             
             if msg_type == "user_message":
                 text = data.get("text", "").strip()
+                requested_model = data.get("model", "gpt-4o")
+                if requested_model in VALID_MODELS:
+                    model_name = requested_model
                 if not text:
                     continue
                 

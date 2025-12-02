@@ -382,6 +382,22 @@
             display: flex;
             gap: 12px;
             margin-bottom: 12px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .model-select {
+            padding: 10px 14px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            background: white;
+            cursor: pointer;
+        }
+
+        .model-select:focus {
+            outline: none;
+            border-color: #90caf9;
         }
     </style>
 </head>
@@ -415,6 +431,13 @@
                     <button class="btn-secondary" id="demoBtn">Start Demo Conversation</button>
                     <button class="btn-voice" id="voiceToggleBtn">Start Voice Session</button>
                     <button class="btn-secondary" id="listenBtn" disabled>Listen to Last Reply</button>
+                    <button class="btn-secondary" id="clearChatBtn">Clear Chat</button>
+                    <button class="btn-success" id="newChatBtn">New Chat</button>
+                    <select id="modelSelect" class="model-select">
+                        <option value="gpt-4o">GPT-4o</option>
+                        <option value="gpt-4.1">GPT-4.1</option>
+                        <option value="gpt-4.1-mini">GPT-4.1 Mini</option>
+                    </select>
                 </div>
                 <div class="input-row">
                     <textarea id="userInput" placeholder="Type your message here..." rows="2"></textarea>
@@ -500,8 +523,12 @@
         const therapistInput = document.getElementById("therapistInput");
         const therapistSendBtn = document.getElementById("therapistSendBtn");
         const therapistVoiceBtn = document.getElementById("therapistVoiceBtn");
+        const clearChatBtn = document.getElementById("clearChatBtn");
+        const newChatBtn = document.getElementById("newChatBtn");
+        const modelSelect = document.getElementById("modelSelect");
         
         let therapistVoiceActive = false;
+        let selectedModel = "gpt-4o";
         let therapistMediaRecorder = null;
         let therapistAudioChunks = [];
 
@@ -553,6 +580,39 @@
             renderMessages();
         });
 
+        clearChatBtn.addEventListener("click", () => {
+            messages.length = 0;
+            renderMessages();
+            lastChatReply = "";
+            listenBtn.disabled = true;
+            sessionStatusEl.textContent = "Chat cleared";
+        });
+
+        newChatBtn.addEventListener("click", () => {
+            messages.length = 0;
+            renderMessages();
+            lastChatReply = "";
+            listenBtn.disabled = true;
+            
+            if (chatWs && chatWs.readyState === WebSocket.OPEN) {
+                chatWs.close();
+            }
+            if (voiceWs && voiceWs.readyState === WebSocket.OPEN) {
+                voiceWs.close();
+            }
+            if (voiceSessionActive) {
+                stopVoiceSession();
+            }
+            
+            setWhisperButtonsEnabled(false);
+            sessionStatusEl.textContent = "New chat started";
+        });
+
+        modelSelect.addEventListener("change", (e) => {
+            selectedModel = e.target.value;
+            sessionStatusEl.textContent = `Model: ${selectedModel}`;
+        });
+
         sendBtn.addEventListener("click", sendMessage);
         userInput.addEventListener("keydown", (e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -586,7 +646,7 @@
             chatWs.onopen = () => {
                 sessionStatusEl.textContent = "Connected";
                 setWhisperButtonsEnabled(true);
-                chatWs.send(JSON.stringify({ type: "user_message", text }));
+                chatWs.send(JSON.stringify({ type: "user_message", text, model: selectedModel }));
             };
 
             chatWs.onmessage = (event) => {
@@ -713,10 +773,13 @@
             const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
             voiceWs = new WebSocket(`${protocol}//${window.location.host}/ws/voice`);
 
-            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            let playbackCursor = 0;
+            const PLAYBACK_RATE = 0.9;
 
             voiceWs.onopen = () => {
                 sessionStatusEl.textContent = "Voice session active";
+                playbackCursor = audioContext.currentTime + 0.1;
 
                 const audioCtx = new AudioContext({ sampleRate: 24000 });
                 const source = audioCtx.createMediaStreamSource(stream);
@@ -741,9 +804,6 @@
                 window.voiceProcessor = { processor, source, audioCtx };
             };
 
-            let pendingAudioData = [];
-            let isPlaying = false;
-
             voiceWs.onmessage = async (event) => {
                 const data = JSON.parse(event.data);
 
@@ -761,7 +821,8 @@
                     }
 
                     if (!audioContext) {
-                        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        playbackCursor = audioContext.currentTime + 0.1;
                     }
 
                     const audioBuffer = audioContext.createBuffer(1, float32.length, 24000);
@@ -769,9 +830,15 @@
 
                     const source = audioContext.createBufferSource();
                     source.buffer = audioBuffer;
-                    source.playbackRate.value = 0.85;
+                    source.playbackRate.value = PLAYBACK_RATE;
                     source.connect(audioContext.destination);
-                    source.start();
+                    
+                    const now = audioContext.currentTime;
+                    if (playbackCursor < now) {
+                        playbackCursor = now + 0.05;
+                    }
+                    source.start(playbackCursor);
+                    playbackCursor += (audioBuffer.duration / PLAYBACK_RATE);
                 }
 
                 if (data.type === "user_transcript") {

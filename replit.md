@@ -9,6 +9,9 @@ A supervised, privacy-focused GPT-powered therapy assistance tool built with Fas
 - TTS Voice: Added calming prefix ("Please speak slowly, calmly, and gently in a therapeutic tone:") and using shimmer voice
 - TTS Playback: Client-side playback slowed to 0.85x for calmer audio
 - Realtime Voice: Fixed chipmunk effect by using proper 24kHz buffer sample rate with browser's default AudioContext, playbackRate 0.9
+- Realtime Voice: Implemented sequential audio queue with playbackCursor to prevent chunk overlap and maintain smooth playback
+- Chat Controls: Added Clear Chat (clears messages only) and New Chat (full session reset including WebSocket cleanup)
+- Model Selection: Added dropdown to choose between gpt-4o, gpt-4.1, gpt-4.1-mini, gpt-4o-mini with backend validation
 
 ## User Preferences
 

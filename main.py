@@ -11,10 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketDisconnect
 
 from openai import OpenAI
+
 # -------------------------------------------------------
-# OpenAI CLIENT (FIXED — NO PROXIES, NEW 2025 FORMAT)
+# OpenAI CLIENT (safe initialization, no proxies)
 # -------------------------------------------------------
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY environment variable not set")
+
+client = OpenAI(api_key=api_key)
 
 # -------------------------------------------------------
 # FASTAPI APP SETUP

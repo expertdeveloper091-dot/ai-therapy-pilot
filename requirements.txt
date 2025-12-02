@@ -2,7 +2,12 @@ fastapi==0.114.0
 uvicorn[standard]==0.23.2
 jinja2==3.1.2
 python-dotenv==1.1.1
+<<<<<<< HEAD
 openai==1.34.0
+=======
+openai>=1.60.0
+>>>>>>> f43130969260691da025a91fc0171e1dedc0f19e
 python-multipart==0.0.6
 websockets==15.0.1
 aiofiles==23.1.0
+httpx>=0.28.1

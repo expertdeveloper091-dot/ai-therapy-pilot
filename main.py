@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import time
+import os 
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, Request, UploadFile, File
@@ -10,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketDisconnect
 
 from openai import OpenAI
-
 # -------------------------------------------------------
 # OpenAI CLIENT (FIXED — NO PROXIES, NEW 2025 FORMAT)
 # -------------------------------------------------------

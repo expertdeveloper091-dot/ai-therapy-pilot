@@ -1,0 +1,189 @@
+I already have a working Therapy Chat Demo (Pilot) in this Replit with:
+
+main.py (FastAPI backend with /ws/chat, /ws/voice, /api/tts, /api/stt)
+
+templates/index.html (frontend with text chat, voice session, therapist controls)
+
+I do not want a brand new project.
+Instead, modify the existing files in-place with the following fixes and improvements:
+
+1. Fix TTS Voice – Too Fast / Too Intense
+
+In main.py, find the /api/tts endpoint. It currently looks like:
+
+response = get_openai_client().audio.speech.create(
+    model="tts-1",
+    voice="nova",
+    input=text,
+    response_format="mp3"
+)
+
+
+Please change it to use a calmer voice and support a slower, more therapeutic tone:
+
+calm_text = (
+    "Please speak slowly, calmly, and gently in a therapeutic tone: "
+    + text
+)
+
+response = get_openai_client().audio.speech.create(
+    model="tts-1",
+    voice="shimmer",  # or "alloy" if shimmer is unavailable
+    input=calm_text,
+    response_format="mp3"
+)
+
+
+Keep the rest of the /api/tts logic the same (privacy comments, no storage, etc.).
+
+2. Slow Down Client Playback for TTS
+
+In templates/index.html, find the “Listen to Last Reply” click handler:
+
+listenBtn.addEventListener("click", async () => {
+    ...
+    if (response.ok) {
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        audioPlayer.src = url;
+        audioPlayer.play();
+        sessionStatusEl.textContent = "Playing audio...";
+        audioPlayer.onended = () => {
+            sessionStatusEl.textContent = "Ready";
+            URL.revokeObjectURL(url);
+        };
+    }
+    ...
+});
+
+
+Modify it so the audio plays back slightly slower and more relaxed:
+
+if (response.ok) {
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    audioPlayer.src = url;
+    audioPlayer.playbackRate = 0.85; // slower, calmer voice (0.8–0.9 is good)
+    audioPlayer.play();
+    sessionStatusEl.textContent = "Playing audio...";
+    audioPlayer.onended = () => {
+        sessionStatusEl.textContent = "Ready";
+        URL.revokeObjectURL(url);
+    };
+}
+
+
+Keep everything else the same.
+
+3. Fix Realtime Voice Playback Speed (/ws/voice)
+
+In templates/index.html, in the voice session code where we:
+
+Decode audio chunks from the /ws/voice WebSocket
+
+Convert them to Float32Array
+
+Create an audioBuffer and a BufferSource
+
+Right now it looks roughly like:
+
+audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+...
+const audioBuffer = audioContext.createBuffer(1, float32.length, 24000);
+audioBuffer.getChannelData(0).set(float32);
+
+const source = audioContext.createBufferSource();
+source.buffer = audioBuffer;
+source.playbackRate.value = 0.3;
+source.connect(audioContext.destination);
+source.start();
+
+
+Please adjust this to:
+
+Use the audioContext’s own sampleRate when creating the buffer
+
+Set playbackRate between 0.8–1.0 (natural human speed)
+
+Replace that block with:
+
+if (!audioContext) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+const audioBuffer = audioContext.createBuffer(1, float32.length, audioContext.sampleRate);
+audioBuffer.getChannelData(0).set(float32);
+
+const source = audioContext.createBufferSource();
+source.buffer = audioBuffer;
+source.playbackRate.value = 0.9; // slightly slower and calmer than 1.0
+source.connect(audioContext.destination);
+source.start();
+
+
+Also, at the top where you currently create:
+
+audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+
+
+change this to:
+
+audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+
+so we don’t hard-force 24 kHz at the browser side.
+
+This should remove the “chipmunk / ultra-fast” effect in realtime sessions.
+
+4. Integrate Full Master Therapist Prompt from the DOCX
+
+I have a document in the Replit project (or I will upload it) called something like:
+
+Master_Therapist_Instructions_FINAL.docx
+
+It contains the full, official Master Therapist Instructions text from the client.
+
+In main.py, there is currently a placeholder:
+
+MASTER_THERAPY_PROMPT = """
+You are an AI reflective tool used within psychotherapy under supervision.
+...
+[TODO: The client's full Master Therapist Instructions will be pasted here.]
+"""
+
+
+Please:
+
+Open the DOCX file with the full master instructions.
+
+Replace the entire placeholder text of MASTER_THERAPY_PROMPT with the full text from that DOCX (inside a Python triple-quoted string).
+
+Make sure there are no stray smart quotes or weird characters that would break Python syntax.
+
+Keep the name MASTER_THERAPY_PROMPT exactly the same.
+
+Ensure that this prompt continues to be used as the first system message in:
+
+text chat (/ws/chat)
+
+realtime voice session (/ws/voice where you build the Realtime session instructions)
+
+Do not expose this prompt to the frontend.
+
+5. Do NOT Change Anything Else
+
+Keep all privacy rules intact (no PHI storage, no logs of clinical content).
+
+Keep all existing endpoints and WebSocket flows (/ws/chat, /ws/voice) working as they already do.
+
+Keep TTFT and full latency metrics for text mode exactly as implemented.
+
+Keep therapist whisper controls and visible therapist messages working as-is.
+
+Just:
+
+Change the TTS voice and playback speed
+
+Improve realtime audio playback speed
+
+Replace MASTER_THERAPY_PROMPT with the full DOCX content.

@@ -713,7 +713,7 @@
             const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
             voiceWs = new WebSocket(`${protocol}//${window.location.host}/ws/voice`);
 
-            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
 
             voiceWs.onopen = () => {
                 sessionStatusEl.textContent = "Voice session active";
@@ -761,7 +761,7 @@
                     }
 
                     if (!audioContext) {
-                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
                     }
 
                     const audioBuffer = audioContext.createBuffer(1, float32.length, 24000);
@@ -769,7 +769,7 @@
 
                     const source = audioContext.createBufferSource();
                     source.buffer = audioBuffer;
-                    source.playbackRate.value = 0.9;
+                    source.playbackRate.value = 0.85;
                     source.connect(audioContext.destination);
                     source.start();
                 }
